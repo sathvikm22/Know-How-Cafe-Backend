@@ -646,8 +646,18 @@ router.post('/logout', async (req, res) => {
 // Google OAuth Configuration
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+
+// Get URLs from environment variables with production defaults
+// For Render backend: https://know-how-cafe-backend.onrender.com
+// For Vercel frontend: https://knowhow-demo1.vercel.app
+const FRONTEND_URL = process.env.FRONTEND_URL || 
+  (process.env.NODE_ENV === 'production' 
+    ? 'https://knowhow-demo1.vercel.app' 
+    : 'http://localhost:5173');
+const BACKEND_URL = process.env.BACKEND_URL || 
+  (process.env.NODE_ENV === 'production' 
+    ? 'https://know-how-cafe-backend.onrender.com' 
+    : 'http://localhost:3000');
 
 // Google OAuth - Initiate (redirects to Google)
 router.get('/google', (req, res) => {

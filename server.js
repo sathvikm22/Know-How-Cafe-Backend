@@ -17,6 +17,7 @@ const corsOptions = {
 
     // Allowed frontend origins
     const allowedOrigins = [
+      // Local development
       'http://localhost:8080',
       'http://localhost:5173',
       'http://localhost:3000',
@@ -24,8 +25,9 @@ const corsOptions = {
       'http://127.0.0.1:5173',
       'http://127.0.0.1:3000',
 
-      // ✅ Your Vercel frontend
-      'https://knowhow-cafe.vercel.app'
+      // Production - Vercel frontend
+      'https://knowhow-demo1.vercel.app',
+      'https://www.knowhow-demo1.vercel.app'
     ];
 
     if (allowedOrigins.includes(origin)) {
