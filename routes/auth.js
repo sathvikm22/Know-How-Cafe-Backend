@@ -1,0 +1,858 @@
+import express from 'express';
+import axios from 'axios';
+import { supabase } from '../config/supabase.js';
+import { sendOTPEmail } from '../config/brevo.js';
+import { generateOTP, isOTPExpired } from '../utils/otp.js';
+import { hashPassword, comparePassword } from '../utils/password.js';
+import jwt from 'jsonwebtoken';
+
+const router = express.Router();
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+// Generate JWT token
+const generateToken = (userId, email) => {
+  return jwt.sign({ userId, email }, JWT_SECRET, { expiresIn: '7d' });
+};
+
+// Send OTP for signup
+router.post('/signup/send-otp', async (req, res) => {
+  try {
+    const { email, name } = req.body;
+
+    if (!email || !name) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Email and name are required' 
+      });
+    }
+
+    // Check if user already exists
+    const { data: existingUser, error: userCheckError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email.toLowerCase())
+      .maybeSingle(); // Use maybeSingle() to avoid error when no record found
+
+    if (existingUser) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'User with this email already exists' 
+      });
+    }
+
+    // Generate OTP
+    const otp = generateOTP();
+
+    // Delete any existing OTPs for this email
+    await supabase
+      .from('otp')
+      .delete()
+      .eq('email', email.toLowerCase())
+      .eq('purpose', 'signup');
+
+    // Store OTP in database
+    const { error: otpError } = await supabase
+      .from('otp')
+      .insert({
+        email: email.toLowerCase(),
+        otp_code: otp,
+        purpose: 'signup',
+        expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString() // 2 minutes from now
+      });
+
+    if (otpError) {
+      console.error('Error storing OTP:', otpError);
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to generate OTP' 
+      });
+    }
+
+    // Send OTP via email (non-blocking in development)
+    const emailResult = await sendOTPEmail(email, otp, 'verification', name);
+    
+    // Log OTP to console in development for easy testing
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`\n📧 OTP for ${email}: ${otp}\n`);
+    }
+
+    res.json({ 
+      success: true, 
+      message: emailResult.warning || 'OTP sent to your email',
+      expiresIn: 120 // 2 minutes in seconds
+    });
+  } catch (error) {
+    console.error('Error in send-otp:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// Verify OTP for signup
+router.post('/signup/verify-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Email and OTP are required' 
+      });
+    }
+
+    // Get the OTP from database
+    const { data: otpData, error: otpError } = await supabase
+      .from('otp')
+      .select('*')
+      .eq('email', email.toLowerCase())
+      .eq('purpose', 'signup')
+      .eq('is_used', false)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (otpError || !otpData) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid or expired OTP' 
+      });
+    }
+
+    // Check if OTP is expired
+    if (isOTPExpired(otpData.created_at)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'OTP has expired. Please request a new one.' 
+      });
+    }
+
+    // Verify OTP
+    if (otpData.otp_code !== otp) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid OTP' 
+      });
+    }
+
+    // Mark OTP as used
+    await supabase
+      .from('otp')
+      .update({ is_used: true })
+      .eq('id', otpData.id);
+
+    res.json({ 
+      success: true, 
+      message: 'OTP verified successfully',
+      verified: true
+    });
+  } catch (error) {
+    console.error('Error in verify-otp:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// Complete signup (after OTP verification)
+router.post('/signup/complete', async (req, res) => {
+  try {
+    const { email, name, password } = req.body;
+
+    if (!email || !name || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Email, name, and password are required' 
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Password must be at least 6 characters long' 
+      });
+    }
+
+    // Check if email was verified (OTP was used)
+    const { data: verifiedOtp } = await supabase
+      .from('otp')
+      .select('*')
+      .eq('email', email.toLowerCase())
+      .eq('purpose', 'signup')
+      .eq('is_used', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (!verifiedOtp) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Please verify your email first' 
+      });
+    }
+
+    // Check if user already exists
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email.toLowerCase())
+      .maybeSingle(); // Use maybeSingle() to avoid error when no record found
+
+    if (existingUser) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'User already exists' 
+      });
+    }
+
+    // Hash password
+    const hashedPassword = await hashPassword(password);
+
+    // Create user
+    const { data: newUser, error: userError } = await supabase
+      .from('users')
+      .insert({
+        email: email.toLowerCase(),
+        name: name,
+        password: hashedPassword,
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (userError) {
+      console.error('Error creating user:', userError);
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to create account' 
+      });
+    }
+
+    // Create login record
+    await supabase
+      .from('login')
+      .insert({
+        user_id: newUser.id,
+        email: email.toLowerCase(),
+        login_time: new Date().toISOString(),
+        ip_address: req.ip || 'unknown'
+      });
+
+    // Generate JWT token
+    const token = generateToken(newUser.id, newUser.email);
+
+    res.json({ 
+      success: true, 
+      message: 'Account created successfully',
+      user: {
+        id: newUser.id,
+        email: newUser.email,
+        name: newUser.name
+      },
+      token
+    });
+  } catch (error) {
+    console.error('Error in complete-signup:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// Login
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Email and password are required' 
+      });
+    }
+
+    // Get user from database
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email.toLowerCase())
+      .single();
+
+    if (userError || !user) {
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Invalid email or password' 
+      });
+    }
+
+    // Verify password
+    const isPasswordValid = await comparePassword(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Invalid email or password' 
+      });
+    }
+
+    // Create login record
+    await supabase
+      .from('login')
+      .insert({
+        user_id: user.id,
+        email: user.email,
+        login_time: new Date().toISOString(),
+        ip_address: req.ip || 'unknown'
+      });
+
+    // Generate JWT token
+    const token = generateToken(user.id, user.email);
+
+    // Check if user is admin (knowhowcafe2025@gmail.com)
+    const isAdmin = user.email.toLowerCase() === 'knowhowcafe2025@gmail.com';
+
+    res.json({ 
+      success: true, 
+      message: 'Login successful',
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name
+      },
+      token,
+      isAdmin
+    });
+  } catch (error) {
+    console.error('Error in login:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// Send OTP for password reset
+router.post('/forgot-password/send-otp', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Email is required' 
+      });
+    }
+
+    // Check if user exists
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, name')
+      .eq('email', email.toLowerCase())
+      .maybeSingle(); // Use maybeSingle() to avoid error when no record found
+
+    if (!user) {
+      // Don't reveal if user exists or not for security
+      return res.json({ 
+        success: true, 
+        message: 'If an account exists with this email, an OTP has been sent' 
+      });
+    }
+
+    // Generate OTP
+    const otp = generateOTP();
+
+    // Delete any existing OTPs for this email
+    await supabase
+      .from('otp')
+      .delete()
+      .eq('email', email.toLowerCase())
+      .eq('purpose', 'password_reset');
+
+    // Store OTP in database
+    const { error: otpError } = await supabase
+      .from('otp')
+      .insert({
+        email: email.toLowerCase(),
+        otp_code: otp,
+        purpose: 'password_reset',
+        expires_at: new Date(Date.now() + 2 * 60 * 1000).toISOString() // 2 minutes from now
+      });
+
+    if (otpError) {
+      console.error('Error storing OTP:', otpError);
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to generate OTP' 
+      });
+    }
+
+    // Send OTP via email (non-blocking in development)
+    const emailResult = await sendOTPEmail(email, otp, 'password_reset', user.name || 'there');
+    
+    // Log OTP to console in development for easy testing
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`\n📧 Password Reset OTP for ${email}: ${otp}\n`);
+    }
+
+    res.json({ 
+      success: true, 
+      message: emailResult.warning || 'If an account exists with this email, an OTP has been sent',
+      expiresIn: 120 // 2 minutes in seconds
+    });
+  } catch (error) {
+    console.error('Error in forgot-password send-otp:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// Verify OTP for password reset
+router.post('/forgot-password/verify-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Email and OTP are required' 
+      });
+    }
+
+    // Get the OTP from database
+    const { data: otpData, error: otpError } = await supabase
+      .from('otp')
+      .select('*')
+      .eq('email', email.toLowerCase())
+      .eq('purpose', 'password_reset')
+      .eq('is_used', false)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (otpError || !otpData) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid or expired OTP' 
+      });
+    }
+
+    // Check if OTP is expired
+    if (isOTPExpired(otpData.created_at)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'OTP has expired. Please request a new one.' 
+      });
+    }
+
+    // Verify OTP
+    if (otpData.otp_code !== otp) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid OTP' 
+      });
+    }
+
+    // Mark OTP as used
+    await supabase
+      .from('otp')
+      .update({ is_used: true })
+      .eq('id', otpData.id);
+
+    res.json({ 
+      success: true, 
+      message: 'OTP verified successfully',
+      verified: true
+    });
+  } catch (error) {
+    console.error('Error in forgot-password verify-otp:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// Reset password (after OTP verification)
+router.post('/forgot-password/reset', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Email and password are required' 
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Password must be at least 6 characters long' 
+      });
+    }
+
+    // Check if email was verified (OTP was used)
+    const { data: verifiedOtp } = await supabase
+      .from('otp')
+      .select('*')
+      .eq('email', email.toLowerCase())
+      .eq('purpose', 'password_reset')
+      .eq('is_used', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (!verifiedOtp) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Please verify your email first' 
+      });
+    }
+
+    // Check if OTP was verified recently (within last 10 minutes)
+    const otpVerifiedAt = new Date(verifiedOtp.updated_at);
+    const now = new Date();
+    const diffInMs = now - otpVerifiedAt;
+    const tenMinutesInMs = 10 * 60 * 1000;
+
+    if (diffInMs > tenMinutesInMs) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'OTP verification expired. Please request a new one.' 
+      });
+    }
+
+    // Get user
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email.toLowerCase())
+      .single();
+
+    if (userError || !user) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'User not found' 
+      });
+    }
+
+    // Hash new password
+    const hashedPassword = await hashPassword(password);
+
+    // Update password
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ password: hashedPassword })
+      .eq('id', user.id);
+
+    if (updateError) {
+      console.error('Error updating password:', updateError);
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to reset password' 
+      });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Password reset successfully' 
+    });
+  } catch (error) {
+    console.error('Error in reset-password:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// Get current user (verify token and return user info)
+router.get('/me', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ 
+        success: false, 
+        message: 'No token provided' 
+      });
+    }
+
+    const token = authHeader.split(' ')[1];
+    
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      
+      // Get user from database
+      const { data: user, error: userError } = await supabase
+        .from('users')
+        .select('id, email, name, created_at')
+        .eq('id', decoded.userId)
+        .maybeSingle();
+
+      if (userError || !user) {
+        return res.status(404).json({ 
+          success: false, 
+          message: 'User not found' 
+        });
+      }
+
+      res.json({ 
+        success: true, 
+        user: {
+          id: user.id,
+          email: user.email,
+          name: user.name
+        }
+      });
+    } catch (tokenError) {
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Invalid or expired token' 
+      });
+    }
+  } catch (error) {
+    console.error('Error in /me:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// Logout (client-side token removal, but endpoint for consistency)
+router.post('/logout', async (req, res) => {
+  try {
+    // Since we're using JWT tokens stored client-side,
+    // logout is mainly handled by removing the token on the client.
+    // This endpoint can be used for server-side session cleanup if needed.
+    res.json({ 
+      success: true, 
+      message: 'Logged out successfully' 
+    });
+  } catch (error) {
+    console.error('Error in logout:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// Google OAuth Configuration
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+
+// Google OAuth - Initiate (redirects to Google)
+router.get('/google', (req, res) => {
+  if (!GOOGLE_CLIENT_ID) {
+    console.error('Google OAuth Error: GOOGLE_CLIENT_ID is not set in environment variables');
+    return res.status(500).json({
+      success: false,
+      message: 'Google OAuth is not configured. Please check your environment variables.'
+    });
+  }
+
+  const redirectUri = `${BACKEND_URL}/api/auth/google/callback`;
+  console.log('Google OAuth Initiated:', {
+    redirectUri,
+    backendUrl: BACKEND_URL,
+    frontendUrl: FRONTEND_URL
+  });
+
+  const scope = 'openid email profile';
+  const responseType = 'code';
+  const accessType = 'offline';
+  const prompt = 'consent';
+
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
+    `client_id=${GOOGLE_CLIENT_ID}&` +
+    `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+    `response_type=${responseType}&` +
+    `scope=${encodeURIComponent(scope)}&` +
+    `access_type=${accessType}&` +
+    `prompt=${prompt}`;
+
+  res.redirect(authUrl);
+});
+
+// Google OAuth - Callback (handles Google redirect)
+router.get('/google/callback', async (req, res) => {
+  try {
+    const { code, error } = req.query;
+
+    console.log('Google OAuth Callback received:', {
+      hasCode: !!code,
+      hasError: !!error,
+      error,
+      backendUrl: BACKEND_URL,
+      frontendUrl: FRONTEND_URL
+    });
+
+    if (error) {
+      console.error('Google OAuth error:', error);
+      return res.redirect(`${FRONTEND_URL}/login?error=oauth_failed`);
+    }
+
+    if (!code) {
+      console.error('Google OAuth: No authorization code received');
+      return res.redirect(`${FRONTEND_URL}/login?error=no_code`);
+    }
+
+    if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+      console.error('Google OAuth: Missing credentials in environment variables');
+      return res.redirect(`${FRONTEND_URL}/login?error=oauth_not_configured`);
+    }
+
+    // Exchange authorization code for tokens
+    const redirectUri = `${BACKEND_URL}/api/auth/google/callback`;
+    console.log('Exchanging code for tokens with redirect_uri:', redirectUri);
+    
+    const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', {
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      code: code,
+      grant_type: 'authorization_code',
+      redirect_uri: redirectUri
+    }, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    const { access_token, id_token } = tokenResponse.data;
+
+    if (!access_token || !id_token) {
+      return res.redirect(`${FRONTEND_URL}/login?error=token_exchange_failed`);
+    }
+
+    // Get user info from Google
+    const userInfoResponse = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: {
+        Authorization: `Bearer ${access_token}`
+      }
+    });
+
+    const googleUser = userInfoResponse.data;
+    const { email, name, picture } = googleUser;
+
+    if (!email) {
+      return res.redirect(`${FRONTEND_URL}/login?error=no_email`);
+    }
+
+    // Check if user exists in database
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id, email, name')
+      .eq('email', email.toLowerCase())
+      .maybeSingle();
+
+    let user;
+    let isNewUser = false;
+
+    if (existingUser) {
+      // User exists - update if needed
+      user = existingUser;
+      
+      // Update name if it changed
+      if (name && name !== existingUser.name) {
+        const { data: updatedUser } = await supabase
+          .from('users')
+          .update({ name: name })
+          .eq('id', existingUser.id)
+          .select()
+          .single();
+        
+        if (updatedUser) {
+          user = updatedUser;
+        }
+      }
+    } else {
+      // New user - create account
+      isNewUser = true;
+      // Generate a random password hash for OAuth users (they'll never use it)
+      const randomPassword = Math.random().toString(36).slice(-12) + Math.random().toString(36).slice(-12);
+      const passwordHash = await hashPassword(randomPassword);
+      
+      const { data: newUser, error: createError } = await supabase
+        .from('users')
+        .insert({
+          email: email.toLowerCase(),
+          name: name || 'Google User',
+          password: passwordHash,
+          created_at: new Date().toISOString()
+        })
+        .select()
+        .single();
+
+      if (createError) {
+        console.error('Error creating user:', createError);
+        return res.redirect(`${FRONTEND_URL}/login?error=user_creation_failed`);
+      }
+
+      user = newUser;
+    }
+
+    // Create login record
+    await supabase
+      .from('login')
+      .insert({
+        user_id: user.id,
+        email: user.email,
+        login_time: new Date().toISOString(),
+        ip_address: req.ip || 'unknown'
+      });
+
+    // Generate JWT token
+    const token = generateToken(user.id, user.email);
+
+    // Check if user is admin
+    const isAdmin = user.email.toLowerCase() === 'knowhowcafe2025@gmail.com';
+
+    // Redirect to frontend with token
+    // Use HTTP 302 redirect (standard for OAuth callbacks)
+    try {
+      const redirectUrl = new URL(`${FRONTEND_URL}/auth/google/callback`);
+      redirectUrl.searchParams.set('token', token);
+      redirectUrl.searchParams.set('email', user.email);
+      redirectUrl.searchParams.set('name', user.name || 'User');
+      if (isAdmin) {
+        redirectUrl.searchParams.set('isAdmin', 'true');
+      }
+      if (isNewUser) {
+        redirectUrl.searchParams.set('newUser', 'true');
+      }
+
+      const finalUrl = redirectUrl.toString();
+      console.log('=== Google OAuth Success ===');
+      console.log('User authenticated:', user.email);
+      console.log('Redirecting to frontend:', finalUrl);
+      console.log('Frontend URL:', FRONTEND_URL);
+      console.log('Token length:', token.length);
+      console.log('===========================');
+
+      // Use HTTP 302 redirect (temporary redirect)
+      // This is the standard way to handle OAuth callbacks
+      res.redirect(302, finalUrl);
+    } catch (urlError) {
+      console.error('Error constructing redirect URL:', urlError);
+      // Fallback: redirect with query string manually
+      const fallbackUrl = `${FRONTEND_URL}/auth/google/callback?token=${encodeURIComponent(token)}&email=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || 'User')}${isAdmin ? '&isAdmin=true' : ''}${isNewUser ? '&newUser=true' : ''}`;
+      console.log('Using fallback redirect URL:', fallbackUrl);
+      res.redirect(302, fallbackUrl);
+    }
+
+  } catch (error) {
+    console.error('Google OAuth callback error:', error);
+    res.redirect(`${FRONTEND_URL}/login?error=oauth_callback_failed`);
+  }
+});
+
+export default router;
+
