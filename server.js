@@ -11,10 +11,11 @@ const PORT = process.env.PORT || 3000;
 // CORS configuration
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow Render health checks, Postman, curl (no Origin)
+
+    // ✅ Allow requests with NO origin (Render health checks, Postman, curl)
     if (!origin) return callback(null, true);
 
-    // Allowed origins
+    // Allowed frontend origins
     const allowedOrigins = [
       'http://localhost:8080',
       'http://localhost:5173',
@@ -23,7 +24,7 @@ const corsOptions = {
       'http://127.0.0.1:5173',
       'http://127.0.0.1:3000',
 
-      // ✅ Your Vercel frontend (added)
+      // ✅ Your Vercel frontend
       'https://knowhow-cafe.vercel.app'
     ];
 
@@ -33,6 +34,7 @@ const corsOptions = {
 
     return callback(new Error(`Not allowed by CORS: ${origin}`));
   },
+
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
@@ -44,10 +46,10 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Trust Render proxy
+// Trust proxy (important for Render)
 app.set('trust proxy', true);
 
-// Health check
+// Health check (Render uses this automatically)
 app.get('/health', (req, res) => {
   res.json({
     success: true,
@@ -59,7 +61,7 @@ app.get('/health', (req, res) => {
 // API routes
 app.use('/api/auth', authRoutes);
 
-// Error handling
+// Error handler
 app.use((err, req, res, next) => {
   console.error('Error:', err);
 
@@ -76,7 +78,7 @@ app.use((err, req, res, next) => {
   });
 });
 
-// 404
+// 404 handler
 app.use((req, res) => {
   res.status(404).json({
     success: false,
